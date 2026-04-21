@@ -9,6 +9,7 @@ import io.th0rgal.oraxen.mechanics.MechanicsManager;
 import io.th0rgal.oraxen.mechanics.provided.gameplay.stringblock.sapling.SaplingListener;
 import io.th0rgal.oraxen.mechanics.provided.gameplay.stringblock.sapling.SaplingTask;
 import io.th0rgal.oraxen.nms.NMSHandlers;
+import io.th0rgal.oraxen.utils.PaperConfigUpdater;
 import io.th0rgal.oraxen.utils.VersionUtil;
 import io.th0rgal.oraxen.utils.logs.Logs;
 import org.apache.commons.lang3.Range;
@@ -65,11 +66,13 @@ public class StringBlockMechanicFactory extends MechanicFactory {
         // Physics-related stuff
         if (VersionUtil.isPaperServer())
             MechanicsManager.registerListeners(OraxenPlugin.get(), getMechanicID(), new StringBlockMechanicListener.StringBlockMechanicPaperListener());
-        if (!VersionUtil.isPaperServer() || !NMSHandlers.isTripwireUpdatesDisabled())
+        boolean tripwireUpdatesDisabled = NMSHandlers.isTripwireUpdatesDisabled();
+        if (!VersionUtil.isPaperServer() || !tripwireUpdatesDisabled)
             MechanicsManager.registerListeners(OraxenPlugin.get(), getMechanicID(), new StringBlockMechanicListener.StringBlockMechanicPhysicsListener());
         // Warn if Paper config is not set (auto-update happens earlier in plugin enable)
-        if (VersionUtil.isPaperServer() && VersionUtil.atOrAbove("1.20.1") && !NMSHandlers.isTripwireUpdatesDisabled()) {
-            Logs.logWarning("Papers block-updates.disable-tripwire-updates is not enabled, restart may be required");
+        if (VersionUtil.isPaperServer() && VersionUtil.atOrAbove("1.20.1") && !tripwireUpdatesDisabled
+                && PaperConfigUpdater.wasBlockUpdateSettingUpdated("disable-tripwire-updates")) {
+            Logs.logWarning("Paper block-updates.disable-tripwire-updates is not enabled, restart may be required");
         }
     }
 
@@ -142,6 +145,25 @@ public class StringBlockMechanicFactory extends MechanicFactory {
                 getModelJson(mechanic.getModel(itemMechanicConfiguration.getParent()
                         .getParent())));
         BLOCK_PER_VARIATION.put(mechanic.getCustomVariation(), mechanic);
+
+        // Register stackable variations: each stack level gets its own blockstate entry
+        // but maps back to the parent mechanic for unified drop/interaction handling
+        for (StringBlockMechanic.StackVariation sv : mechanic.getStackVariations()) {
+            if (!Range.between(1, 127).contains(sv.customVariation())) {
+                Logs.logError("Stackable custom_variation " + sv.customVariation() + " of " + mechanic.getItemID() + " must be between 1 and 127!");
+                continue;
+            }
+            if (BLOCK_PER_VARIATION.containsKey(sv.customVariation())) {
+                Logs.logError("Stackable custom_variation " + sv.customVariation() + " of " + mechanic.getItemID() + " collides with an existing block!");
+                continue;
+            }
+            String stackModel = sv.model() != null ? sv.model()
+                    : mechanic.getModel(itemMechanicConfiguration.getParent().getParent());
+            variants.add(getBlockstateVariantName(sv.customVariation()), getModelJson(stackModel));
+            // Map stack variations back to the parent mechanic
+            BLOCK_PER_VARIATION.put(sv.customVariation(), mechanic);
+        }
+
         addToImplemented(mechanic);
         return mechanic;
     }
@@ -248,7 +270,8 @@ public class StringBlockMechanicFactory extends MechanicFactory {
                         "min_light", MechanicConfigProperty.integer("min_light", "Minimum light level to grow", 9, 0, 15),
                         "grow_block", MechanicConfigProperty.string("grow_block", "Block ID when grown"),
                         "grow_chance", MechanicConfigProperty.decimal("grow_chance", "Growth chance per check", 0.1, 0.0, 1.0)
-                ))
+                )),
+                MechanicConfigProperty.list("stackable", "List of stack variations (custom_variation + model per level)")
         );
     }
 }

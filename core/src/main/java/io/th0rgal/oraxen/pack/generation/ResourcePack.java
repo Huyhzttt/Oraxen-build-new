@@ -24,6 +24,7 @@ import io.th0rgal.oraxen.utils.customarmor.CustomArmorType;
 import io.th0rgal.oraxen.utils.customarmor.ShaderArmorTextures;
 import io.th0rgal.oraxen.utils.customarmor.TrimArmorDatapack;
 import io.th0rgal.oraxen.utils.logs.Logs;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.bukkit.Material;
 
@@ -36,6 +37,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
 
@@ -47,86 +51,221 @@ public class ResourcePack {
     private TrimArmorDatapack trimArmorDatapack;
     private ComponentArmorModels componentArmorModels;
     private static final File packFolder = new File(OraxenPlugin.get().getDataFolder(), "pack");
+    private static final Set<String> LEGACY_SHADER_OVERLAY_DIRECTORIES = Set.of("overlay_1_21_6_plus", "overlay_1_21_4_5");
     private final File pack = new File(packFolder, packFolder.getName() + ".zip");
     private final SoundGenerator soundGenerator = new SoundGenerator();
     private PackFileCollector fileCollector;
     private final TextShaderGenerator textShaderGenerator = new TextShaderGenerator();
     /** Resolved multi-version flag (may differ from Settings if fallback occurred). */
     private boolean multiVersionResolved = false;
+    private final AtomicBoolean generationInProgress = new AtomicBoolean(false);
 
     public ResourcePack() {
         // we use maps to avoid duplicate
         packModifiers = new HashMap<>();
-        outputFiles = new HashMap<>();
+        outputFiles = new java.util.concurrent.ConcurrentHashMap<>();
     }
 
     public void generate() {
+        if (!generationInProgress.compareAndSet(false, true)) {
+            Logs.logWarning("Resource-pack generation is already in progress, skipping duplicate request");
+            return;
+        }
+
+        // Re-evaluate dispatch mode normalization on each generation (covers reload)
+        io.th0rgal.oraxen.pack.dispatch.PackSender.resetDispatchNormalization();
+
         boolean multiVersionEnabled = Settings.MULTI_VERSION_PACKS.toBool();
         boolean isSelfHost = Settings.UPLOAD_TYPE.toString().equalsIgnoreCase("self-host");
 
-        if (multiVersionEnabled) {
-            if (isSelfHost) {
-                Logs.logError("Multi-version packs are incompatible with self-host upload!");
-                Logs.logError("SelfHost can only serve one file at /pack.zip");
-                Logs.logError("Falling back to single-pack mode for this generation");
-                multiVersionEnabled = false;
-            } else if (!Settings.UPLOAD.toBool()) {
-                Logs.logWarning("Multi-version packs require upload to be enabled!");
-                Logs.logWarning("Falling back to single-pack mode for this generation");
-                multiVersionEnabled = false;
-            }
-        }
-
-        this.multiVersionResolved = multiVersionEnabled;
-
-        if (multiVersionEnabled) {
-            // Detect mode-switch BEFORE nulling the old manager, so generateMultiVersion
-            // knows this is a reload even though both managers will be null by then.
-            boolean switchingFromSinglePack = OraxenPlugin.get().getUploadManager() != null;
-
-            // Unregister and clear single-pack manager if switching from single-pack mode.
-            // Clearing the reference prevents getPackURL()/getPackSHA1() from returning
-            // stale data from the old mode's manager.
-            UploadManager oldUploadManager = OraxenPlugin.get().getUploadManager();
-            if (oldUploadManager != null) {
-                oldUploadManager.unregister();
-                OraxenPlugin.get().setUploadManager(null);
+        try {
+            if (multiVersionEnabled) {
+                if (isSelfHost) {
+                    Logs.logError("Multi-version packs are incompatible with self-host upload!");
+                    Logs.logError("SelfHost can only serve one file at /pack.zip");
+                    Logs.logError("Falling back to single-pack mode for this generation");
+                    multiVersionEnabled = false;
+                } else if (!Settings.UPLOAD.toBool()) {
+                    Logs.logWarning("Multi-version packs require upload to be enabled!");
+                    Logs.logWarning("Falling back to single-pack mode for this generation");
+                    multiVersionEnabled = false;
+                }
             }
 
-            generateMultiVersion(switchingFromSinglePack);
-            return;
+            this.multiVersionResolved = multiVersionEnabled;
+
+            if (multiVersionEnabled) {
+                // Detect mode-switch BEFORE nulling the old manager, so generateMultiVersion
+                // knows this is a reload even though both managers will be null by then.
+                boolean switchingFromSinglePack = OraxenPlugin.get().getUploadManager() != null;
+
+                // Unregister and clear single-pack manager if switching from single-pack mode.
+                // Clearing the reference prevents getPackURL()/getPackSHA1() from returning
+                // stale data from the old mode's manager.
+                UploadManager oldUploadManager = OraxenPlugin.get().getUploadManager();
+                if (oldUploadManager != null) {
+                    oldUploadManager.unregister();
+                    OraxenPlugin.get().setUploadManager(null);
+                }
+
+                generateMultiVersion(switchingFromSinglePack);
+                finishGeneration();
+                return;
+            }
+
+            // Unregister and clear multi-version manager if switching from multi-version mode.
+            // Without clearing, OraxenPlugin.getPackURL()/getPackSHA1() would still check
+            // the stale multiVersionUploadManager first and return wrong pack data.
+            // setMultiVersionUploadManager(null) internally calls unregister() on the
+            // old manager, so a separate unregister() call is not needed.
+            OraxenPlugin.get().setMultiVersionUploadManager(null);
+
+            if (!prepareGenerationPreamble()) {
+                finishGeneration();
+                return;
+            }
+
+            startSinglePackGenerationAsync();
+        } catch (RuntimeException exception) {
+            finishGeneration();
+            throw exception;
         }
+    }
 
-        // Unregister and clear multi-version manager if switching from multi-version mode.
-        // Without clearing, OraxenPlugin.getPackURL()/getPackSHA1() would still check
-        // the stale multiVersionUploadManager first and return wrong pack data.
-        // setMultiVersionUploadManager(null) internally calls unregister() on the
-        // old manager, so a separate unregister() call is not needed.
-        OraxenPlugin.get().setMultiVersionUploadManager(null);
+    private void startSinglePackGenerationAsync() {
+        ExecutorService packWorker = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "Oraxen-PackWorker");
+            thread.setDaemon(true);
+            return thread;
+        });
 
-        // Legacy single-pack generation - prepare and generate base assets
-        List<VirtualFile> output = prepareAndGenerateBaseAssets();
-
-        // Early exit if generation is disabled (empty output)
-        if (output.isEmpty()) {
-            return;
+        try {
+            packWorker.submit(() -> {
+                try {
+                    generateAsyncSafeItemAssets();
+                    SchedulerUtil.runTask(() -> continueSinglePackGenerationOnMain(packWorker));
+                } catch (Exception exception) {
+                    handleGenerationFailure(packWorker, "async item asset generation", exception);
+                }
+            });
+        } catch (RuntimeException exception) {
+            packWorker.shutdown();
+            finishGeneration();
+            throw exception;
         }
+    }
 
-        // Zip and upload the single pack
-        SchedulerUtil.runTask(() -> {
+    private void continueSinglePackGenerationOnMain(ExecutorService packWorker) {
+        try {
+            generateMiscAssets();
+            applyPackModifiers();
+
+            List<VirtualFile> output = new ArrayList<>(outputFiles.values());
+            submitAsyncPackCollection(packWorker, output);
+        } catch (Exception exception) {
+            handleGenerationFailure(packWorker, "sync pack generation", exception);
+        }
+    }
+
+    private void submitAsyncPackCollection(ExecutorService packWorker, List<VirtualFile> output) {
+        try {
+            packWorker.submit(() -> {
+                try {
+                    collectPackFilesAsyncSafe(output);
+                    SchedulerUtil.runTask(() -> continuePostCollectionOnMain(packWorker, output));
+                } catch (Exception exception) {
+                    handleGenerationFailure(packWorker, "async pack collection", exception);
+                }
+            });
+        } catch (RuntimeException exception) {
+            handleGenerationFailure(packWorker, "async pack collection scheduling", exception);
+        }
+    }
+
+    private void continuePostCollectionOnMain(ExecutorService packWorker, List<VirtualFile> output) {
+        try {
+            handleCustomArmor(output);
+            applyArmorStandModelOverrides(output);
+            Collections.sort(output);
+            submitAsyncPostProcessing(packWorker, output);
+        } catch (Exception exception) {
+            handleGenerationFailure(packWorker, "sync custom armor generation", exception);
+        }
+    }
+
+    private void submitAsyncPostProcessing(ExecutorService packWorker, List<VirtualFile> output) {
+        try {
+            packWorker.submit(() -> {
+                try {
+                    postProcessOutputAsyncSafe(output);
+                    SchedulerUtil.runTask(() -> finishSinglePackOutputOnMain(packWorker, output));
+                } catch (Exception exception) {
+                    handleGenerationFailure(packWorker, "async pack post-processing", exception);
+                }
+            });
+        } catch (RuntimeException exception) {
+            handleGenerationFailure(packWorker, "async pack post-processing scheduling", exception);
+        }
+    }
+
+    private void finishSinglePackOutputOnMain(ExecutorService packWorker, List<VirtualFile> output) {
+        try {
+            soundGenerator.generateSound(output);
+
             OraxenPackGeneratedEvent event = new OraxenPackGeneratedEvent(output);
             EventUtils.callEvent(event);
-            ZipUtils.writeZipFile(pack, event.getOutput());
+            writeSinglePackAsync(packWorker, event.getOutput());
+        } catch (Exception exception) {
+            handleGenerationFailure(packWorker, "sync pack finalization", exception);
+        }
+    }
 
-            UploadManager uploadManager = OraxenPlugin.get().getUploadManager();
-            if (uploadManager != null) { // If the uploadManager isnt null, this was triggered by a pack-reload
-                uploadManager.uploadAsyncAndSendToPlayers(OraxenPlugin.get().getResourcePack(), true, true);
-            } else { // Otherwise this is was triggered on server-startup
-                uploadManager = new UploadManager(OraxenPlugin.get());
-                OraxenPlugin.get().setUploadManager(uploadManager);
-                uploadManager.uploadAsyncAndSendToPlayers(OraxenPlugin.get().getResourcePack(), false, false);
-            }
-        });
+    private void writeSinglePackAsync(ExecutorService packWorker, List<VirtualFile> output) {
+        try {
+            packWorker.submit(() -> {
+                try {
+                    ZipUtils.writeZipFile(pack, output);
+                    SchedulerUtil.runTask(this::uploadGeneratedPackAndFinish);
+                } catch (Exception exception) {
+                    handleGenerationFailure(packWorker, "async pack writing", exception);
+                } finally {
+                    packWorker.shutdown();
+                }
+            });
+        } catch (RuntimeException exception) {
+            handleGenerationFailure(packWorker, "async pack writing scheduling", exception);
+        }
+    }
+
+    private void uploadGeneratedPackAndFinish() {
+        try {
+            uploadGeneratedPack();
+        } finally {
+            finishGeneration();
+        }
+    }
+
+    private void uploadGeneratedPack() {
+        UploadManager uploadManager = OraxenPlugin.get().getUploadManager();
+        if (uploadManager != null) { // If the uploadManager isnt null, this was triggered by a pack-reload
+            uploadManager.uploadAsyncAndSendToPlayers(OraxenPlugin.get().getResourcePack(), true, true);
+        } else { // Otherwise this is was triggered on server-startup
+            uploadManager = new UploadManager(OraxenPlugin.get());
+            OraxenPlugin.get().setUploadManager(uploadManager);
+            uploadManager.uploadAsyncAndSendToPlayers(OraxenPlugin.get().getResourcePack(), false, false);
+        }
+    }
+
+    private void finishGeneration() {
+        generationInProgress.set(false);
+    }
+
+    private void handleGenerationFailure(ExecutorService packWorker, String phase, Exception exception) {
+        Logs.logError("Failed during " + phase);
+        exception.printStackTrace();
+        packWorker.shutdown();
+        // Reset directly — do not rely on scheduler which may be unavailable during shutdown
+        finishGeneration();
     }
 
     /**
@@ -135,12 +274,13 @@ public class ResourcePack {
      *
      * @return List of generated VirtualFiles ready for zipping
      */
-    private List<VirtualFile> prepareAndGenerateBaseAssets() {
+    private boolean prepareGenerationPreamble() {
         // Reset state
         outputFiles.clear();
         textShaderGenerator.reset();
 
         makeDirsIfNotExists(packFolder, new File(packFolder, "assets"));
+        cleanLegacyShaderOverlayDirectories();
 
         componentArmorModels = CustomArmorType.getSetting() == CustomArmorType.COMPONENT ? new ComponentArmorModels()
                 : null;
@@ -153,7 +293,7 @@ public class ResourcePack {
         extractRequired();
 
         if (!Settings.GENERATE.toBool())
-            return new ArrayList<>();
+            return false;
 
         if (Settings.HIDE_SCOREBOARD_NUMBERS.toBool() && PluginUtils.isEnabled("HappyHUD")) {
             Logs.logError("HappyHUD detected with hide_scoreboard_numbers enabled!");
@@ -171,7 +311,37 @@ public class ResourcePack {
         extractInPackIfNotExists(new File(packFolder, "pack.png"));
         updatePackMcmeta();
 
-        // Generate all base assets
+        return true;
+    }
+
+    private void cleanLegacyShaderOverlayDirectories() {
+        for (String directory : LEGACY_SHADER_OVERLAY_DIRECTORIES) {
+            File legacyOverlayDirectory = new File(packFolder, directory);
+            if (!legacyOverlayDirectory.isDirectory()) continue;
+
+            try {
+                FileUtils.deleteDirectory(legacyOverlayDirectory);
+                if (Settings.DEBUG.toBool()) {
+                    Logs.logInfo("Removed legacy shader overlay directory: " + directory);
+                }
+            } catch (IOException e) {
+                Logs.logWarning("Failed to remove legacy shader overlay directory " + directory + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Prepares the environment and generates all base pack assets.
+     * This is shared logic between single-pack and multi-version generation.
+     *
+     * @return List of generated VirtualFiles ready for zipping
+     */
+    private List<VirtualFile> prepareAndGenerateBaseAssets() {
+        if (!prepareGenerationPreamble()) {
+            return new ArrayList<>();
+        }
+
+        generateAsyncSafeItemAssets();
         return generateBaseAssets();
     }
 
@@ -182,17 +352,69 @@ public class ResourcePack {
      * @return List of generated VirtualFiles
      */
     private List<VirtualFile> generateBaseAssets() {
-        final Map<Material, Map<String, ItemBuilder>> texturedItems = extractTexturedItems();
-
-        generateItemAppearanceAssets(texturedItems);
         generateMiscAssets();
         applyPackModifiers();
 
         List<VirtualFile> output = new ArrayList<>(outputFiles.values());
         collectPackFiles(output);
+        applyArmorStandModelOverrides(output);
         postProcessOutput(output);
 
         return output;
+    }
+
+    private void applyArmorStandModelOverrides(List<VirtualFile> output) {
+        Map<String, org.bukkit.util.Vector> scaleByModelPath = new LinkedHashMap<>();
+
+        for (Map.Entry<String, ItemBuilder> entry : OraxenItems.getEntries()) {
+            ItemBuilder item = entry.getValue();
+            if (!item.hasOraxenMeta()) continue;
+
+            OraxenMeta meta = item.getOraxenMeta();
+            if (!meta.hasPackInfos() || !meta.hasArmorStandHeadScale()) continue;
+
+            String modelFilePath = meta.getModelPath() + "/" + meta.getModelName() + ".json";
+            org.bukkit.util.Vector newScale = meta.getArmorStandHeadScale();
+            org.bukkit.util.Vector existingScale = scaleByModelPath.get(modelFilePath);
+
+            if (existingScale != null && !sameScale(existingScale, newScale)) {
+                Logs.logWarning("Multiple armor-stand furniture items target the same model with different scale values: " + modelFilePath);
+                Logs.logWarning("Using the latest configured scale from item <gold>" + entry.getKey(), true);
+            }
+
+            scaleByModelPath.put(modelFilePath, newScale);
+        }
+
+        if (scaleByModelPath.isEmpty()) return;
+
+        for (VirtualFile virtualFile : output) {
+            org.bukkit.util.Vector scale = scaleByModelPath.get(virtualFile.getPath());
+            if (scale == null) continue;
+
+            JsonObject modelJson = virtualFile.toJsonObject();
+            if (modelJson == null) continue;
+
+            ModelGenerator.applyHeadScale(modelJson, scale);
+            InputStream previousStream = virtualFile.getInputStream();
+            if (previousStream != null) {
+                try {
+                    previousStream.close();
+                } catch (IOException ignored) {
+                }
+            }
+            virtualFile.setInputStream(new ByteArrayInputStream(modelJson.toString().getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    private boolean sameScale(org.bukkit.util.Vector first, org.bukkit.util.Vector second) {
+        return Double.compare(first.getX(), second.getX()) == 0
+                && Double.compare(first.getY(), second.getY()) == 0
+                && Double.compare(first.getZ(), second.getZ()) == 0;
+    }
+
+    private void generateAsyncSafeItemAssets() {
+        final Map<Material, Map<String, ItemBuilder>> texturedItems = extractTexturedItems();
+        generateItemAppearanceAssets(texturedItems);
     }
 
     /**
@@ -255,19 +477,7 @@ public class ResourcePack {
      */
     private void collectPackFiles(List<VirtualFile> output) {
         try {
-            fileCollector.getFilesInFolder(packFolder, output, packFolder.getCanonicalPath(), packFolder.getName() + ".zip");
-
-            File[] files = packFolder.listFiles();
-            if (files != null)
-                for (final File folder : files) {
-                    if (!folder.isDirectory()) continue;
-                    if (folder.getName().equals("uploads") || folder.getName().equals("__MACOSX")) continue;
-                    fileCollector.getAllFiles(folder, output,
-                            folder.getName().matches("models|textures|lang|font|sounds") ? "assets/minecraft" : "");
-                }
-
-            mergeUploadedPacks(output);
-            convertGlobalLang(output);
+            collectPackFilesAsyncSafe(output);
             handleCustomArmor(output);
             Collections.sort(output);
         } catch (IOException e) {
@@ -275,11 +485,32 @@ public class ResourcePack {
         }
     }
 
+    private void collectPackFilesAsyncSafe(List<VirtualFile> output) throws IOException {
+        fileCollector.getFilesInFolder(packFolder, output, packFolder.getCanonicalPath(), packFolder.getName() + ".zip");
+
+        File[] files = packFolder.listFiles();
+        if (files != null)
+            for (final File folder : files) {
+                if (!folder.isDirectory()) continue;
+                if (folder.getName().equals("uploads") || folder.getName().equals("__MACOSX")) continue;
+                fileCollector.getAllFiles(folder, output,
+                        folder.getName().matches("models|textures|lang|font|sounds") ? "assets/minecraft" : "");
+            }
+
+        mergeUploadedPacks(output);
+        convertGlobalLang(output);
+    }
+
     /**
      * Post-processes the output: verifies textures, generates atlases,
      * merges duplicates, filters excluded extensions, and generates sounds.
      */
     private void postProcessOutput(List<VirtualFile> output) {
+        postProcessOutputAsyncSafe(output);
+        soundGenerator.generateSound(output);
+    }
+
+    private void postProcessOutputAsyncSafe(List<VirtualFile> output) {
         Set<String> malformedTextures = new HashSet<>();
         if (Settings.VERIFY_PACK_FILES.toBool())
             malformedTextures = PackFileCollector.verifyPackFormatting(output);
@@ -303,8 +534,6 @@ public class ResourcePack {
                         excluded.add(virtual);
             output.removeAll(excluded);
         }
-
-        soundGenerator.generateSound(output);
     }
 
     /**
@@ -356,10 +585,6 @@ public class ResourcePack {
      * This must be called after {@link #generateFont()} to ensure overlay directories exist.
      */
     private void updatePackMcmetaOverlays() {
-        if (!textShaderGenerator.wereShaderOverlaysGenerated()) {
-            return;
-        }
-
         Path mcmetaPath = packFolder.toPath().resolve("pack.mcmeta");
         if (!mcmetaPath.toFile().exists()) {
             return;
@@ -375,12 +600,12 @@ public class ResourcePack {
                 return;
             }
 
-            MinecraftVersion currentVersion = MinecraftVersion.getCurrentVersion();
-            if (currentVersion.isAtLeast(new MinecraftVersion("1.21.4"))) {
-                addShaderOverlayEntries(root, currentVersion);
+            boolean overlaysChanged = addShaderOverlayEntries(root);
+
+            if (!overlaysChanged) {
+                return;
             }
 
-            // Use Gson with pretty printing for readable output
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             Files.writeString(mcmetaPath, gson.toJson(root), StandardCharsets.UTF_8);
         } catch (Exception e) {
@@ -397,19 +622,18 @@ public class ResourcePack {
      * Minecraft client versions. The client automatically selects the appropriate
      * overlay based on its pack_format.</p>
      *
-     * @param root The root pack.mcmeta JSON object
-     * @param serverVersion The server's Minecraft version
+     * <p>Also expands the base pack's supported format range to cover all overlay
+     * format ranges, so that clients of any supported version see the pack as
+     * compatible.</p>
      */
-    private void addShaderOverlayEntries(JsonObject root, MinecraftVersion serverVersion) {
-        // Get existing overlays or create new one
+    private boolean addShaderOverlayEntries(JsonObject root) {
         JsonObject overlays;
         if (root.has("overlays")) {
             overlays = root.getAsJsonObject("overlays");
         } else {
             overlays = new JsonObject();
         }
-        
-        // Get existing entries array or create new one
+
         JsonArray entries;
         if (overlays.has("entries")) {
             entries = overlays.getAsJsonArray("entries");
@@ -417,38 +641,111 @@ public class ResourcePack {
             entries = new JsonArray();
         }
 
-        int initialSize = entries.size();
+        int originalEntriesSize = entries.size();
+        Set<String> knownDirectories = new HashSet<>(java.util.Arrays.stream(ShaderOverlay.values())
+                .map(ShaderOverlay::directory)
+                .collect(java.util.stream.Collectors.toSet()));
+        knownDirectories.addAll(LEGACY_SHADER_OVERLAY_DIRECTORIES);
+        JsonArray filteredEntries = new JsonArray();
+        for (JsonElement element : entries) {
+            if (!element.isJsonObject()) {
+                filteredEntries.add(element);
+                continue;
+            }
 
-        if (serverVersion.isAtLeast(new MinecraftVersion("1.21.6"))) {
-            // Server is 1.21.6+, base shaders are 1.21.6 format
-            // Add overlay for 1.21.4/1.21.5 clients (pack_format 46-54)
-            JsonObject entry = new JsonObject();
-            JsonObject formats = new JsonObject();
-            formats.addProperty("min_inclusive", TextShaderTarget.PACK_FORMAT_1_21_4);
-            formats.addProperty("max_inclusive", TextShaderTarget.PACK_FORMAT_1_21_6 - 1);
-            entry.add("formats", formats);
-            entry.addProperty("directory", textShaderGenerator.getOverlay12145Name());
-            entries.add(entry);
-        } else if (serverVersion.isAtLeast(new MinecraftVersion("1.21.4"))) {
-            // Server is 1.21.4/1.21.5, base shaders are 1.21.4 format
-            // Add overlay for 1.21.6+ clients (pack_format 55+)
-            JsonObject entry = new JsonObject();
-            JsonObject formats = new JsonObject();
-            formats.addProperty("min_inclusive", TextShaderTarget.PACK_FORMAT_1_21_6);
-            formats.addProperty("max_inclusive", 999); // Support future versions
-            entry.add("formats", formats);
-            entry.addProperty("directory", textShaderGenerator.getOverlay1216PlusName());
-            entries.add(entry);
-        }
-
-        int newEntriesAdded = entries.size() - initialSize;
-        if (newEntriesAdded > 0) {
-            overlays.add("entries", entries);
-            root.add("overlays", overlays);
-            if (Settings.DEBUG.toBool()) {
-                Logs.logInfo("Added " + newEntriesAdded + " shader overlay entries to pack.mcmeta");
+            JsonObject existingEntry = element.getAsJsonObject();
+            String directory = existingEntry.has("directory") ? existingEntry.get("directory").getAsString() : null;
+            if (directory == null || !knownDirectories.contains(directory)) {
+                filteredEntries.add(existingEntry);
             }
         }
+        entries = filteredEntries;
+
+        int filteredEntriesSize = entries.size();
+
+        for (ShaderOverlay overlay : textShaderGenerator.getGeneratedOverlays()) {
+            JsonObject entry = new JsonObject();
+            JsonObject formats = new JsonObject();
+            formats.addProperty("min_inclusive", overlay.minFormat());
+            formats.addProperty("max_inclusive", overlay.maxFormat());
+            entry.add("formats", formats);
+            entry.addProperty("directory", overlay.directory());
+            if (overlay.minFormat() > 64 || overlay.maxFormat() > 64) {
+                entry.addProperty("min_format", overlay.minFormat());
+                entry.addProperty("max_format", overlay.maxFormat());
+            }
+            entries.add(entry);
+        }
+
+        int newEntriesAdded = entries.size() - filteredEntriesSize;
+        boolean entriesRemoved = filteredEntriesSize != originalEntriesSize;
+        boolean entriesChanged = newEntriesAdded > 0 || entriesRemoved;
+        if (!entriesChanged) {
+            return false;
+        }
+
+        overlays.add("entries", entries);
+        root.add("overlays", overlays);
+
+        expandSupportedFormatsRange(root);
+
+        if (Settings.DEBUG.toBool()) {
+            if (newEntriesAdded > 0 && entriesRemoved) {
+                Logs.logInfo("Refreshed shader overlay entries in pack.mcmeta");
+            } else if (newEntriesAdded > 0) {
+                Logs.logInfo("Added " + newEntriesAdded + " shader overlay entries to pack.mcmeta");
+            } else {
+                Logs.logInfo("Removed stale shader overlay entries from pack.mcmeta");
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Expands the base pack's supported_formats / min_format / max_format range
+     * to cover all overlay format ranges, ensuring that clients of any supported
+     * version see the pack as compatible.
+     *
+     * <p>For servers on 1.21.9+ (format 65+), also adds the legacy
+     * {@code supported_formats} field so that pre-1.21.9 clients can read the
+     * format range (they don't understand {@code min_format}/{@code max_format}).</p>
+     */
+    private void expandSupportedFormatsRange(JsonObject root) {
+        List<ShaderOverlay> overlayList = textShaderGenerator.getGeneratedOverlays();
+        if (overlayList.isEmpty()) return;
+
+        int minOverlayFormat = overlayList.stream()
+                .mapToInt(ShaderOverlay::minFormat).min().orElse(Integer.MAX_VALUE);
+        int maxOverlayFormat = overlayList.stream()
+                .mapToInt(ShaderOverlay::maxFormat).max().orElse(0);
+
+        JsonObject pack = root.has("pack") && root.get("pack").isJsonObject()
+                ? root.getAsJsonObject("pack") : new JsonObject();
+
+        int serverFormat = ResourcePackFormatUtil.getCurrentResourcePackFormat();
+        ShaderOverlay serverOverlay = ShaderOverlay.forPackFormat(serverFormat);
+        int serverGroupMax = serverOverlay != null ? serverOverlay.maxFormat() : serverFormat;
+        int effectiveMin = Math.min(serverFormat, minOverlayFormat);
+        int effectiveMax = Math.max(serverGroupMax, maxOverlayFormat);
+
+        if (serverFormat >= 65) {
+            pack.addProperty("min_format", effectiveMin);
+            pack.addProperty("max_format", effectiveMax);
+            JsonObject supportedFormats = new JsonObject();
+            supportedFormats.addProperty("min_inclusive", effectiveMin);
+            supportedFormats.addProperty("max_inclusive", effectiveMax);
+            pack.add("supported_formats", supportedFormats);
+        } else if (serverFormat >= 18) {
+            JsonObject supportedFormats = new JsonObject();
+            supportedFormats.addProperty("min_inclusive", effectiveMin);
+            supportedFormats.addProperty("max_inclusive", effectiveMax);
+            pack.add("supported_formats", supportedFormats);
+            pack.remove("min_format");
+            pack.remove("max_format");
+        }
+
+        root.add("pack", pack);
     }
 
 
@@ -511,7 +808,7 @@ public class ResourcePack {
                 if (oraxenMeta.shouldGenerateModel()) {
                     writeStringToVirtual(modelPath, modelName, new ModelGenerator(oraxenMeta).getJson().toString());
                 }
-                final Map<String, ItemBuilder> items = texturedItems.computeIfAbsent(item.build().getType(),
+                final Map<String, ItemBuilder> items = texturedItems.computeIfAbsent(item.getType(),
                         k -> new LinkedHashMap<>());
 
                 // Insert in order of CustomModelData
@@ -540,7 +837,7 @@ public class ResourcePack {
                     newItems.put(itemId, item);
                 }
 
-                texturedItems.put(item.build().getType(), newItems);
+                texturedItems.put(item.getType(), newItems);
             }
         }
         return texturedItems;
@@ -950,6 +1247,20 @@ public class ResourcePack {
         folder = !folder.endsWith("/") ? folder : folder.substring(0, folder.length() - 1);
         addOutputFiles(
                 new VirtualFile(folder, name, new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    public static void deleteFileFromVirtualAndDisk(String folder, String name) {
+        folder = !folder.endsWith("/") ? folder : folder.substring(0, folder.length() - 1);
+        String virtualPath = folder.isEmpty() ? name : folder + "/" + name;
+        outputFiles.remove(virtualPath);
+
+        File file = new File(packFolder, virtualPath);
+        if (file.exists()) {
+            file.delete();
+            if (Settings.DEBUG.toBool()) {
+                Logs.logInfo("Deleted stale file from disk: " + virtualPath);
+            }
+        }
     }
 
     private static void writeImageToVirtual(String folder, String name, BufferedImage image) {
