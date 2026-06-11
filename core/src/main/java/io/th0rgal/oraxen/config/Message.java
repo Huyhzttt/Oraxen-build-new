@@ -37,6 +37,7 @@ public enum Message {
     NOT_ENOUGH_SPACE("general.not_enough_space"),
     EXIT_MENU("general.exit_menu"),
     NO_EMOJIS("general.no_emojis"),
+    INTRODUCTION_GUIDE("general.introduction_guide"),
 
     // logs
     PLUGIN_LOADED("logs.loaded"),
@@ -63,10 +64,15 @@ public enum Message {
     MYTHICCRUCIBLE_MISSING_PLUGIN("logs.mythiccrucible.missing_plugin"),
 
     // command
-    COMMAND_HELP("command.help"),
     COMMAND_JOIN_MESSAGE("command.join"),
     DEBUG_TOGGLE("command.debug.toggle"),
     VERSION("command.version"),
+    REMOVE_BRANDING_SUCCESS("command.remove_branding.success"),
+    REMOVE_BRANDING_FAILED("command.remove_branding.failed"),
+    REMOVE_BRANDING_CONFIRM("command.remove_branding.confirm"),
+    REMOVE_DEFAULTS_SUCCESS("command.remove_defaults.success"),
+    REMOVE_DEFAULTS_FAILED("command.remove_defaults.failed"),
+    REMOVE_DEFAULTS_CONFIRM("command.remove_defaults.confirm"),
 
     RECIPE_NO_BUILDER("command.recipe.no_builder"),
     RECIPE_NO_FURNACE("command.recipe.no_furnace"),
@@ -77,6 +83,7 @@ public enum Message {
 
     GIVE_PLAYER("command.give.player"),
     GIVE_PLAYERS("command.give.players"),
+    TOTEM_ANIMATION_SUCCESS("command.totem_animation.success"),
 
     DYE_SUCCESS("command.dye.success"),
     DYE_WRONG_COLOR("command.dye.wrong_color"),

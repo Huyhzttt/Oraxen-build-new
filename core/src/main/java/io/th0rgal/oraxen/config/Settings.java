@@ -14,6 +14,8 @@ public enum Settings {
     DEBUG("debug"),
     PLUGIN_LANGUAGE("Plugin.language"),
     KEEP_UP_TO_DATE("Plugin.keep_this_up_to_date"),
+    INTRODUCTION_ENABLED("Plugin.introduction.enabled"),
+    INTRODUCTION_CONSOLE_SENT("Plugin.introduction.console_sent"),
     REPAIR_COMMAND_ORAXEN_DURABILITY("Plugin.commands.repair.oraxen_durability_only"),
     AUTO_UPDATE_PAPER_CONFIG("Plugin.auto_update_paper_config"),
     GENERATE_DEFAULT_ASSETS("Plugin.generation.default_assets"),
@@ -54,6 +56,7 @@ public enum Settings {
 
     // Custom Armor
     CUSTOM_ARMOR_TYPE("CustomArmor.type"),
+    CUSTOM_ARMOR_AUTO_SELECT_TYPE("CustomArmor.auto_select_type"),
     CUSTOM_ARMOR_COMPONENT_ASSIGN("CustomArmor.component_settings.auto_assign_component"),
     DISABLE_LEATHER_REPAIR_CUSTOM("CustomArmor.disable_leather_repair"),
     CUSTOM_ARMOR_TRIMS_MATERIAL("CustomArmor.trims_settings.material_replacement"),
@@ -72,6 +75,8 @@ public enum Settings {
     // ItemUpdater
     UPDATE_ITEMS("ItemUpdater.update_items"),
     UPDATE_ITEMS_ON_RELOAD("ItemUpdater.update_items_on_reload"),
+    UPDATE_TILE_ENTITY_CONTENTS("ItemUpdater.update_tile_entity_contents"),
+    UPDATE_ENTITY_CONTENTS("ItemUpdater.update_entity_contents"),
     OVERRIDE_RENAMED_ITEMS("ItemUpdater.override_renamed_items"),
     OVERRIDE_ITEM_LORE("ItemUpdater.override_item_lore"),
 
@@ -95,6 +100,7 @@ public enum Settings {
 
     //Pack
     GENERATE("Pack.generation.generate"),
+    DISABLE_MCMETA_GENERATION("Pack.generation.disable_mcmeta_generation"),
     MULTI_VERSION_PACKS("Pack.generation.multi_version_packs"),
     EXCLUDED_FILE_EXTENSIONS("Pack.generation.excluded_file_extensions"),
     FIX_FORCE_UNICODE_GLYPHS("Pack.generation.fix_force_unicode_glyphs"),
@@ -106,6 +112,7 @@ public enum Settings {
     GENERATE_MODEL_BASED_ON_TEXTURE_PATH("Pack.generation.auto_generated_models_follow_texture_path"),
     COMPRESSION("Pack.generation.compression"),
     PROTECTION("Pack.generation.protection"),
+    PACK_OBFUSCATION_TYPE("Pack.generation.obfuscation.type"),
     // 1.21.4+ appearance systems (can be combined)
     APPEARANCE_ITEM_PROPERTIES("Pack.generation.appearance.item_properties"),
     APPEARANCE_MODEL_DATA_IDS("Pack.generation.appearance.model_data_ids"),
@@ -130,6 +137,8 @@ public enum Settings {
 
     POLYMATH_SERVER("Pack.upload.polymath.server"),
     POLYMATH_SECRET("Pack.upload.polymath.secret"),
+    LOBFILE_API_KEY("Pack.upload.lobfile.api-key"),
+    LOBFILE_PACK_NAME("Pack.upload.lobfile.pack-name"),
 
     SEND_PRE_JOIN("Pack.dispatch.send_pre_join"),
     SEND_ON_JOIN("Pack.dispatch.send_on_join"),
@@ -147,6 +156,7 @@ public enum Settings {
     RECEIVE_ENABLED("Pack.receive.enabled"),
     RECEIVE_ALLOWED_ACTIONS("Pack.receive.accepted.actions"),
     RECEIVE_LOADED_ACTIONS("Pack.receive.loaded.actions"),
+    RECEIVE_LOADED_SOUND("Pack.receive.loaded.actions.sound.enabled"),
     RECEIVE_FAILED_ACTIONS("Pack.receive.failed_download.actions"),
     RECEIVE_DENIED_ACTIONS("Pack.receive.denied.actions"),
     RECEIVE_FAILED_RELOAD_ACTIONS("Pack.receive.failed_reload.actions"),

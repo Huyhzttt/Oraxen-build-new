@@ -1,6 +1,8 @@
 package io.th0rgal.oraxen.mechanics.provided.gameplay.furniture;
 
 import io.th0rgal.oraxen.OraxenPlugin;
+import io.th0rgal.oraxen.api.OraxenFurniture;
+import io.th0rgal.oraxen.api.events.OraxenItemsLoadedEvent;
 import io.th0rgal.oraxen.mechanics.Mechanic;
 import io.th0rgal.oraxen.mechanics.MechanicConfigProperty;
 import io.th0rgal.oraxen.mechanics.MechanicFactory;
@@ -8,7 +10,15 @@ import io.th0rgal.oraxen.mechanics.MechanicsManager;
 import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.evolution.EvolutionListener;
 import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.evolution.EvolutionTask;
 import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.jukebox.JukeboxListener;
+import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.text.FurnitureTextEntry;
+import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.text.FurnitureTextPacketBridge;
+import io.th0rgal.oraxen.mechanics.provided.gameplay.furniture.text.FurnitureTextRegistry;
+import io.th0rgal.oraxen.utils.blocksounds.BlockSounds;
+import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Entity;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -37,11 +47,14 @@ public class FurnitureFactory extends MechanicFactory {
                 new FurnitureListener(),
                 new FurnitureUpdater(),
                 new EvolutionListener(),
-                new JukeboxListener()
+                new JukeboxListener(),
+                new FurnitureTextLoadListener()
         );
         evolvingFurnitures = false;
         instance = this;
         FurniturePacketDispatcher.init();
+        FurnitureTextPacketBridge.unregister();
+        FurnitureTextPacketBridge.register();
         customSounds = areCustomSoundsEnabled();
 
         if (customSounds) MechanicsManager.registerListeners(OraxenPlugin.get(), getMechanicID(), new FurnitureSoundListener());
@@ -70,11 +83,50 @@ public class FurnitureFactory extends MechanicFactory {
     public static boolean areCustomSoundsEnabled() {
         ConfigurationSection customSoundsSection = OraxenPlugin.get().getConfigsManager().getMechanics()
                 .getConfigurationSection("custom_block_sounds");
-        return customSoundsSection == null || customSoundsSection.getBoolean("stringblock_and_furniture", true);
+        return BlockSounds.isFurnitureSoundEnabled(customSoundsSection);
     }
 
     public static FurnitureFactory getInstance() {
         return instance;
+    }
+
+    private static void registerLoadedFurnitureText() {
+        for (org.bukkit.World world : Bukkit.getWorlds()) {
+            world.getEntities().stream()
+                    .filter(OraxenFurniture::isBaseEntity)
+                    .forEach(entity -> registerTextEntity(entity, true));
+        }
+    }
+
+    static void registerTextEntity(Entity entity) {
+        registerTextEntity(entity, false);
+    }
+
+    static void registerTextEntity(Entity entity, boolean spawnForMissingViewers) {
+        if (!OraxenPlugin.supportsDisplayEntities) return;
+        FurnitureMechanic mechanic = OraxenFurniture.getFurnitureMechanic(entity);
+        if (mechanic != null && mechanic.hasTextDefinitions()) {
+            FurnitureTextEntry previous = FurnitureTextRegistry.byUuid(entity.getUniqueId());
+            boolean reused = FurnitureTextRegistry.canReuse(entity.getUniqueId(), mechanic.getTextDefinitions().size());
+            if (previous != null && !reused) {
+                FurnitureTextPacketBridge.destroyAndUnregister(entity.getUniqueId());
+            }
+            FurnitureTextEntry entry = FurnitureTextRegistry.register(entity, mechanic.getTextDefinitions());
+            if (previous != null && reused) {
+                FurnitureTextPacketBridge.updateTrackedViewers(entry);
+            } else if (spawnForMissingViewers) {
+                FurnitureTextPacketBridge.spawnForTrackedViewers(entry);
+            }
+        } else {
+            FurnitureTextPacketBridge.destroyAndUnregister(entity.getUniqueId());
+        }
+    }
+
+    private static final class FurnitureTextLoadListener implements Listener {
+        @EventHandler
+        public void onItemsLoaded(OraxenItemsLoadedEvent event) {
+            registerLoadedFurnitureText();
+        }
     }
 
     public static EvolutionTask getEvolutionTask() {
@@ -95,6 +147,7 @@ public class FurnitureFactory extends MechanicFactory {
         if (evolutionTask != null)
             evolutionTask.cancel();
         FurniturePacketDispatcher.shutdown();
+        FurnitureTextPacketBridge.unregister();
     }
 
     @Override
@@ -128,6 +181,7 @@ public class FurnitureFactory extends MechanicFactory {
                 MechanicConfigProperty.bool("farmland_required", "Whether farmland is required for placement", false),
                 MechanicConfigProperty.bool("farmblock_required", "Whether farmblock is required for placement", false),
                 MechanicConfigProperty.integer("light", "Light level emitted (0-15)", 0, 0, 15),
+                MechanicConfigProperty.list("lights", "List of light entries formatted '<x>,<y>,<z> <level>'"),
                 MechanicConfigProperty.enumType("restricted_rotation", "Rotation restriction mode",
                         List.of("NONE", "STRICT", "VERY_STRICT")),
                 MechanicConfigProperty.bool("rotatable", "Whether furniture can be rotated after placement", true),
@@ -140,6 +194,7 @@ public class FurnitureFactory extends MechanicFactory {
                         "height", MechanicConfigProperty.decimal("height", "Seat height offset", 0.0),
                         "yaw", MechanicConfigProperty.decimal("yaw", "Seat rotation", 0.0)
                 )),
+                MechanicConfigProperty.list("seats", "List of seat offsets relative to the furniture center formatted '<x>,<y>,<z>' or '<x>,<y>,<z> <yaw>'"),
                 MechanicConfigProperty.list("barriers", "List of barrier block positions relative to furniture"),
                 MechanicConfigProperty.object("display_entity_properties", "Display entity configuration", Map.of(
                         "display_transform", MechanicConfigProperty.enumType("display_transform", "Display transform mode",

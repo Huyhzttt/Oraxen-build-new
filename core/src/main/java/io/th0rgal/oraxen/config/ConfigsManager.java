@@ -10,6 +10,7 @@ import io.th0rgal.oraxen.items.ItemParser;
 import io.th0rgal.oraxen.items.ItemTemplate;
 import io.th0rgal.oraxen.items.ModelData;
 import io.th0rgal.oraxen.pack.generation.DuplicationHandler;
+import io.th0rgal.oraxen.sound.SoundConfigMigration;
 import io.th0rgal.oraxen.utils.AdventureUtils;
 import io.th0rgal.oraxen.utils.OraxenYaml;
 import io.th0rgal.oraxen.utils.Utils;
@@ -20,6 +21,7 @@ import org.bukkit.Material;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
 import java.io.IOException;
@@ -51,6 +53,7 @@ public class ConfigsManager {
     private final YamlConfiguration defaultSettings;
     private final YamlConfiguration defaultFont;
     private final YamlConfiguration defaultSound;
+    private final YamlConfiguration defaultPaintings;
     private final YamlConfiguration defaultLanguage;
     private final YamlConfiguration defaultHud;
     private final YamlConfiguration defaultTextEffects;
@@ -58,20 +61,21 @@ public class ConfigsManager {
     private YamlConfiguration settings;
     private YamlConfiguration font;
     private YamlConfiguration sound;
+    private YamlConfiguration paintings;
     private YamlConfiguration language;
     private YamlConfiguration hud;
     private YamlConfiguration textEffects;
     private File itemsFolder;
     private File glyphsFolder;
     private File schematicsFolder;
-    private File gesturesFolder;
 
     public ConfigsManager(JavaPlugin plugin) {
         this.plugin = plugin;
         defaultMechanics = extractDefault("mechanics.yml");
         defaultSettings = extractDefault("settings.yml");
         defaultFont = extractDefault("font.yml");
-        defaultSound = extractDefault("sound.yml");
+        defaultSound = extractDefault("sounds.yml");
+        defaultPaintings = extractDefault("paintings.yml");
         defaultLanguage = extractDefault("languages/english.yml");
         defaultHud = extractDefault("hud.yml");
         defaultTextEffects = extractDefault("text_effects.yml");
@@ -105,6 +109,10 @@ public class ConfigsManager {
         return sound != null ? sound : defaultSound;
     }
 
+    public YamlConfiguration getPaintings() {
+        return paintings != null ? paintings : defaultPaintings;
+    }
+
     public YamlConfiguration getTextEffects() {
         return textEffects != null ? textEffects : defaultTextEffects;
     }
@@ -134,10 +142,14 @@ public class ConfigsManager {
     public void validatesConfig() {
         ResourcesManager tempManager = new ResourcesManager(OraxenPlugin.get());
         mechanics = validate(tempManager, "mechanics.yml", defaultMechanics);
+        migrateLegacyBlockMechanics();
         settings = validate(tempManager, "settings.yml", defaultSettings);
         font = validate(tempManager, "font.yml", defaultFont);
         hud = validate(tempManager, "hud.yml", defaultHud);
-        sound = validate(tempManager, "sound.yml", defaultSound);
+        migrateLegacySoundFile();
+        sound = validate(tempManager, "sounds.yml", defaultSound);
+        migrateSoundConfigIfNeeded();
+        paintings = validate(tempManager, "paintings.yml", defaultPaintings);
         textEffects = validate(tempManager, "text_effects.yml", defaultTextEffects);
         File languagesFolder = new File(plugin.getDataFolder(), "languages");
         languagesFolder.mkdir();
@@ -170,14 +182,64 @@ public class ConfigsManager {
                 tempManager.extractConfigsInFolder("schematics", "schem");
         }
 
-        // check gestures
-        gesturesFolder = new File(plugin.getDataFolder(), "gestures");
-        if (!gesturesFolder.exists()) {
-            gesturesFolder.mkdirs();
-            if (Settings.GENERATE_DEFAULT_CONFIGS.toBool())
-                tempManager.extractConfigsInFolder("gestures", "yml");
-        }
+    }
 
+    private void migrateLegacyBlockMechanics() {
+        File mechanicsFile = new File(plugin.getDataFolder(), "mechanics.yml");
+        if (!LegacyBlockMechanicMigration.migrate(mechanics))
+            return;
+
+        try {
+            MigrationBackups.moveToMigrated(plugin.getDataFolder(), mechanicsFile);
+            mechanics.save(mechanicsFile);
+            Logs.logSuccess("Migrated legacy block mechanics to the unified block mechanic");
+        } catch (IOException e) {
+            Logs.logError("Failed to save migrated mechanics.yml");
+            Logs.debug(e);
+        }
+    }
+
+    private void migrateLegacySoundFile() {
+        File soundsFile = new File(plugin.getDataFolder(), "sounds.yml");
+        File legacySoundFile = new File(plugin.getDataFolder(), "sound.yml");
+        if (!legacySoundFile.exists())
+            return;
+
+        YamlConfiguration legacyConfiguration = OraxenYaml.loadConfiguration(legacySoundFile);
+        SoundConfigMigration.migrateToNewFormat(legacyConfiguration);
+
+        boolean soundsFileAlreadyExists = soundsFile.exists();
+        YamlConfiguration soundsConfiguration = soundsFileAlreadyExists
+                ? OraxenYaml.loadConfiguration(soundsFile)
+                : legacyConfiguration;
+        boolean changed = !soundsFileAlreadyExists
+                || SoundConfigMigration.mergeSounds(soundsConfiguration, legacyConfiguration);
+
+        try {
+            if (changed || !soundsFileAlreadyExists)
+                soundsConfiguration.save(soundsFile);
+            Logs.logSuccess(soundsFileAlreadyExists
+                    ? "Merged sound.yml into sounds.yml"
+                    : "Migrated sound.yml to sounds.yml");
+            MigrationBackups.moveToMigrated(plugin.getDataFolder(), legacySoundFile);
+        } catch (IOException e) {
+            Logs.logError("Failed to migrate sound.yml to sounds.yml");
+            Logs.debug(e);
+        }
+    }
+
+    private void migrateSoundConfigIfNeeded() {
+        File soundsFile = new File(plugin.getDataFolder(), "sounds.yml");
+        if (sound == null || !SoundConfigMigration.migrateToNewFormat(sound))
+            return;
+
+        try {
+            sound.save(soundsFile);
+            Logs.logSuccess("Migrated sounds.yml to the new sound list format");
+        } catch (IOException e) {
+            Logs.logError("Failed to save migrated sounds.yml");
+            Logs.debug(e);
+        }
     }
 
     private YamlConfiguration validate(ResourcesManager resourcesManager, String configName,
@@ -188,10 +250,26 @@ public class ConfigsManager {
         for (String key : defaultConfiguration.getKeys(true)) {
             if (!skippedYamlKeys.stream().filter(key::startsWith).toList().isEmpty())
                 continue;
-            if (configuration.get(key) == null) {
+            Object currentValue = configuration.get(key);
+            if (currentValue == null) {
                 updated = true;
                 Message.UPDATING_CONFIG.log(AdventureUtils.tagResolver("option", key));
                 configuration.set(key, defaultConfiguration.get(key));
+                continue;
+            }
+            // Migrate language values that lost a required placeholder (e.g. older
+            // installs of general.reload missing the new <reloaded> tag introduced in 1.214.0).
+            if (configName.startsWith("languages/")
+                    && currentValue instanceof String currentString
+                    && defaultConfiguration.get(key) instanceof String defaultString) {
+                for (String placeholder : REQUIRED_LANG_PLACEHOLDERS.getOrDefault(key, List.of())) {
+                    if (defaultString.contains(placeholder) && !currentString.contains(placeholder)) {
+                        updated = true;
+                        Message.UPDATING_CONFIG.log(AdventureUtils.tagResolver("option", key));
+                        configuration.set(key, defaultString);
+                        break;
+                    }
+                }
             }
         }
 
@@ -219,6 +297,13 @@ public class ConfigsManager {
 
     private final List<String> removedYamlKeys = List.of(
             "armorpotioneffects");
+
+    // Keys in user language files that must be re-migrated if they're missing a
+    // placeholder that the bundled default provides. Without this, servers
+    // upgrading would keep the old reload string and the placeholder would render as nothing.
+    private static final Map<String, List<String>> REQUIRED_LANG_PLACEHOLDERS = Map.of(
+            "general.reload", List.of("<reloaded>")
+    );
 
     /**
      * Holds parsing state for glyph configuration processing.
@@ -287,17 +372,18 @@ public class ConfigsManager {
             }
 
             YamlConfiguration configuration = OraxenYaml.loadConfiguration(file);
-            boolean fileChanged = parseAllGlyphsFromFile(configuration, output, ctx);
-            saveConfigIfChanged(file, configuration, fileChanged);
+            GlyphFileParseResult result = parseAllGlyphsFromFile(configuration, output, ctx);
+            saveConfigIfChanged(file, configuration, result.fileChanged, result.forceSave);
         }
     }
 
     /**
      * Parses all glyph types from a single file.
      */
-    private boolean parseAllGlyphsFromFile(YamlConfiguration configuration, GlyphParseOutput output,
+    private GlyphFileParseResult parseAllGlyphsFromFile(YamlConfiguration configuration, GlyphParseOutput output,
             GlyphParseContext ctx) {
         boolean fileChanged = false;
+        boolean forceSave = false;
 
         for (String key : configuration.getKeys(false)) {
             ConfigurationSection glyphSection = configuration.getConfigurationSection(key);
@@ -333,9 +419,11 @@ public class ConfigsManager {
 
             if (result.fileChanged)
                 fileChanged = true;
+            if (result.forceSave)
+                forceSave = true;
         }
 
-        return fileChanged;
+        return new GlyphFileParseResult(fileChanged, forceSave);
     }
 
     public Collection<Glyph> parseGlyphConfigs() {
@@ -369,32 +457,33 @@ public class ConfigsManager {
      * Also handles legacy 'code' field migration during collection.
      */
     private void collectCodepointsFromSection(String key, ConfigurationSection section, GlyphParseContext ctx) {
-        if (section.isList("chars")) {
-            List<String> charsList = section.getStringList("chars");
-            for (String row : charsList) {
+        List<String> unicodeRows = getDefinedUnicodeRows(section);
+        if (unicodeRows != null) {
+            for (String row : unicodeRows) {
                 for (char c : row.toCharArray()) {
                     ctx.usedCodepoints.add((int) c);
                 }
             }
-            if (!charsList.isEmpty() && !charsList.get(0).isEmpty()) {
-                ctx.charPerGlyph.put(key, charsList.get(0).charAt(0));
+            if (!unicodeRows.isEmpty() && !unicodeRows.get(0).isEmpty()) {
+                ctx.charPerGlyph.put(key, unicodeRows.get(0).charAt(0));
             }
-        } else {
-            // Check for legacy 'code' field first (integer codepoint)
-            // This ensures correct character is used before glyph creation
-            if (section.contains("code") && section.isInt("code")) {
-                char character = (char) section.getInt("code");
-                ctx.charPerGlyph.put(key, character);
-                ctx.usedCodepoints.add((int) character);
-                return;
-            }
+            return;
+        }
 
-            String characterString = section.getString("char", "");
-            if (!characterString.isBlank()) {
-                char character = characterString.charAt(0);
-                ctx.charPerGlyph.put(key, character);
-                ctx.usedCodepoints.add((int) character);
-            }
+        // Check for legacy 'code' field first (integer codepoint)
+        // This ensures correct character is used before glyph creation
+        if (section.contains("code") && section.isInt("code")) {
+            char character = (char) section.getInt("code");
+            ctx.charPerGlyph.put(key, character);
+            ctx.usedCodepoints.add((int) character);
+            return;
+        }
+
+        String characterString = section.getString("char", "");
+        if (!characterString.isBlank()) {
+            char character = characterString.charAt(0);
+            ctx.charPerGlyph.put(key, character);
+            ctx.usedCodepoints.add((int) character);
         }
     }
 
@@ -404,18 +493,20 @@ public class ConfigsManager {
     private void parseGlyphFiles(List<File> glyphFiles, List<Glyph> output, GlyphParseContext ctx) {
         for (File file : glyphFiles) {
             YamlConfiguration configuration = OraxenYaml.loadConfiguration(file);
-            boolean fileChanged = parseGlyphsFromFile(configuration, output, ctx);
-            saveConfigIfChanged(file, configuration, fileChanged);
+            GlyphFileParseResult result = parseGlyphsFromFile(configuration, output, ctx);
+            saveConfigIfChanged(file, configuration, result.fileChanged, result.forceSave);
         }
     }
 
     /**
      * Parses all glyphs from a single configuration file.
      *
-     * @return true if the file was modified
+     * @return file modification and save policy state
      */
-    private boolean parseGlyphsFromFile(YamlConfiguration configuration, List<Glyph> output, GlyphParseContext ctx) {
+    private GlyphFileParseResult parseGlyphsFromFile(YamlConfiguration configuration, List<Glyph> output,
+            GlyphParseContext ctx) {
         boolean fileChanged = false;
+        boolean forceSave = false;
 
         for (String key : configuration.getKeys(false)) {
             ConfigurationSection glyphSection = configuration.getConfigurationSection(key);
@@ -428,25 +519,31 @@ public class ConfigsManager {
 
             if (result.fileChanged)
                 fileChanged = true;
+            if (result.forceSave)
+                forceSave = true;
         }
 
-        return fileChanged;
+        return new GlyphFileParseResult(fileChanged, forceSave);
     }
 
     /**
      * Result of creating a single glyph.
      */
-    private record GlyphParseResult(Glyph glyph, boolean fileChanged) {
+    private record GlyphFileParseResult(boolean fileChanged, boolean forceSave) {
+    }
+
+    private record GlyphParseResult(Glyph glyph, boolean fileChanged, boolean forceSave) {
     }
 
     /**
      * Creates a glyph from a configuration section.
      */
     private GlyphParseResult createGlyph(String key, ConfigurationSection section, GlyphParseContext ctx) {
-        GlyphGrid grid = GlyphGrid.fromConfig(section.getConfigurationSection("grid"));
+        GlyphGrid grid = GlyphGrid.fromGlyphConfig(section);
+        List<String> configuredUnicodes = getDefinedUnicodeRows(section);
 
-        if (section.isList("chars")) {
-            return createMultiCharGlyph(key, section, grid);
+        if (configuredUnicodes != null) {
+            return createConfiguredGlyph(key, section, configuredUnicodes);
         } else if (grid.isMultiCell()) {
             return createGridGlyph(key, section, grid, ctx);
         } else {
@@ -454,10 +551,14 @@ public class ConfigsManager {
         }
     }
 
-    private GlyphParseResult createMultiCharGlyph(String key, ConfigurationSection section, GlyphGrid grid) {
-        List<String> unicodeRows = section.getStringList("chars");
-        Glyph glyph = new Glyph(key, section, unicodeRows, grid);
-        return new GlyphParseResult(glyph, false);
+    private GlyphParseResult createConfiguredGlyph(String key, ConfigurationSection section,
+            List<String> unicodeRows) {
+        boolean fileChanged = migrateLegacyUnicodeKeys(section, unicodeRows);
+        GlyphGrid effectiveGrid = GlyphGrid.fromUnicodeRows(unicodeRows);
+
+        Glyph glyph = new Glyph(key, section, unicodeRows, effectiveGrid);
+        glyph.setFileChanged(fileChanged);
+        return new GlyphParseResult(glyph, fileChanged, fileChanged);
     }
 
     private GlyphParseResult createGridGlyph(String key, ConfigurationSection section, GlyphGrid grid,
@@ -484,22 +585,22 @@ public class ConfigsManager {
             if (Settings.DISABLE_AUTOMATIC_GLYPH_CODE.toBool()) {
                 // Cache for future reloads within this server session
                 GRID_GLYPH_UNICODE_CACHE.put(key, unicodeRows);
-                Logs.logWarning("Grid glyph '" + key + "' has no 'chars' list defined but " +
+                Logs.logWarning("Grid glyph '" + key + "' has no 'char' list defined but " +
                         Settings.DISABLE_AUTOMATIC_GLYPH_CODE.getPath() + " is enabled.");
                 Logs.logWarning(
                         "Characters will be preserved within this server session, but will change on server restart.");
                 Logs.logWarning("To ensure consistent characters across restarts, either disable " +
                         Settings.DISABLE_AUTOMATIC_GLYPH_CODE.getPath() +
-                        " or manually add a 'chars' list to this glyph's configuration.", true);
+                        " or manually add a 'char' list to this glyph's configuration.", true);
             } else {
-                section.set("chars", unicodeRows);
+                setConfiguredUnicodeRows(section, unicodeRows);
                 fileChanged = true;
             }
         }
 
         Glyph glyph = new Glyph(key, section, unicodeRows, grid);
         glyph.setFileChanged(fileChanged);
-        return new GlyphParseResult(glyph, fileChanged);
+        return new GlyphParseResult(glyph, fileChanged, false);
     }
 
     /**
@@ -521,6 +622,7 @@ public class ConfigsManager {
     }
 
     private GlyphParseResult createSingleCharGlyph(String key, ConfigurationSection section, GlyphParseContext ctx) {
+        boolean hadLegacyCode = section.contains("code");
         char character = ctx.charPerGlyph.getOrDefault(key, Character.MIN_VALUE);
         if (character == Character.MIN_VALUE) {
             character = findNextCodepoint(ctx.usedCodepoints, 42000);
@@ -528,11 +630,11 @@ public class ConfigsManager {
             ctx.usedCodepoints.add((int) character);
         }
         Glyph glyph = new Glyph(key, section, character);
-        return new GlyphParseResult(glyph, glyph.isFileChanged());
+        return new GlyphParseResult(glyph, glyph.isFileChanged(), hadLegacyCode);
     }
 
-    private void saveConfigIfChanged(File file, YamlConfiguration configuration, boolean fileChanged) {
-        if (fileChanged && !Settings.DISABLE_AUTOMATIC_GLYPH_CODE.toBool()) {
+    private void saveConfigIfChanged(File file, YamlConfiguration configuration, boolean fileChanged, boolean forceSave) {
+        if (fileChanged && (forceSave || !Settings.DISABLE_AUTOMATIC_GLYPH_CODE.toBool())) {
             try {
                 configuration.save(file);
             } catch (IOException e) {
@@ -563,6 +665,64 @@ public class ConfigsManager {
         }
 
         return rows;
+    }
+
+    @Nullable
+    private List<String> getDefinedUnicodeRows(ConfigurationSection section) {
+        List<String> unicodeRows = null;
+
+        if (section.isList("char")) {
+            unicodeRows = sanitizeUnicodeRows(section.getStringList("char"));
+        } else if (section.isString("char")) {
+            String unicode = section.getString("char", "");
+            if (!unicode.isBlank()) {
+                unicodeRows = List.of(unicode);
+            }
+        }
+
+        if (unicodeRows != null && !unicodeRows.isEmpty()) {
+            return unicodeRows;
+        }
+
+        if (section.isList("chars")) {
+            unicodeRows = sanitizeUnicodeRows(section.getStringList("chars"));
+        } else if (section.isString("chars")) {
+            String unicode = section.getString("chars", "");
+            if (!unicode.isBlank()) {
+                unicodeRows = List.of(unicode);
+            }
+        }
+
+        return unicodeRows == null || unicodeRows.isEmpty() ? null : unicodeRows;
+    }
+
+    private List<String> sanitizeUnicodeRows(List<String> unicodeRows) {
+        return unicodeRows.stream()
+                .filter(Objects::nonNull)
+                .filter(row -> !row.isBlank())
+                .toList();
+    }
+
+    private boolean migrateLegacyUnicodeKeys(ConfigurationSection section, List<String> unicodeRows) {
+        boolean fileChanged = false;
+
+        if (!section.contains("char")) {
+            setConfiguredUnicodeRows(section, unicodeRows);
+            fileChanged = true;
+        }
+
+        if (section.contains("chars")) {
+            section.set("chars", null);
+            fileChanged = true;
+        }
+
+        return fileChanged;
+    }
+
+    private void setConfiguredUnicodeRows(ConfigurationSection section, List<String> unicodeRows) {
+        if (unicodeRows.isEmpty()) return;
+        boolean multiBitmap = unicodeRows.size() > 1 || unicodeRows.stream().anyMatch(row -> row.length() > 1);
+        section.set("char", multiBitmap ? unicodeRows : unicodeRows.get(0));
     }
 
     /**
@@ -598,8 +758,8 @@ public class ConfigsManager {
                 ConfigurationSection itemSection = configuration.getConfigurationSection(key);
                 if (itemSection == null)
                     continue;
-                ConfigurationSection packSection = itemSection.getConfigurationSection("Pack");
-                Material material = Material.getMaterial(itemSection.getString("material", ""));
+                ConfigurationSection packSection = OraxenYaml.getConfigurationSection(itemSection, "Pack");
+                Material material = OraxenYaml.getMaterial(itemSection.getString("material", ""));
                 if (packSection == null || material == null)
                     continue;
                 int modelData = packSection.getInt("custom_model_data", -1);
@@ -676,6 +836,7 @@ public class ConfigsManager {
             parseMap.put(itemKey, new ItemParser(itemSection));
         }
         boolean configUpdated = false;
+        boolean blockConfigMigrated = false;
         // because we must have parse all the items before building them to be able to
         // use available models
         Map<String, ItemBuilder> map = new LinkedHashMap<>();
@@ -694,9 +855,14 @@ public class ConfigsManager {
             }
             if (itemParser.isConfigUpdated())
                 configUpdated = true;
+            if (itemParser.isBlockConfigMigrated())
+                blockConfigMigrated = true;
         }
 
         if (configUpdated) {
+            if (blockConfigMigrated)
+                MigrationBackups.moveToMigrated(plugin.getDataFolder(), itemFile);
+
             String content = config.saveToString();
             if (VersionUtil.atOrAbove("1.20.5"))
                 content = content.replace("displayname: ", "itemname: ");

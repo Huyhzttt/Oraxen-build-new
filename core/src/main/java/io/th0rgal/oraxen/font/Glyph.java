@@ -31,7 +31,7 @@ import java.util.stream.Collectors;
 
 public class Glyph {
 
-    public static final Character WHITESPACE_GLYPH = '\ue000';
+    public static final char WHITESPACE_GLYPH = '\ue000';
 
     private boolean fileChanged = false;
 
@@ -170,6 +170,20 @@ public class Glyph {
     }
 
     /**
+     * Returns all assigned characters flattened into a single string.
+     *
+     * @return All assigned characters in row-major order
+     */
+    @NotNull
+    public String getCharacters() {
+        StringBuilder sb = new StringBuilder();
+        for (String row : unicodeRows) {
+            sb.append(row);
+        }
+        return sb.toString();
+    }
+
+    /**
      * Returns all unicode rows for multi-character glyphs.
      *
      * @return Unmodifiable list of unicode strings (one per row)
@@ -185,11 +199,7 @@ public class Glyph {
      * @return All characters from all rows
      */
     public char[] getAllChars() {
-        StringBuilder sb = new StringBuilder();
-        for (String row : unicodeRows) {
-            sb.append(row);
-        }
-        return sb.toString().toCharArray();
+        return getCharacters().toCharArray();
     }
 
     /**
@@ -270,6 +280,9 @@ public class Glyph {
      * @return JsonObject for the font provider
      */
     public JsonObject toJson() {
+        if (unicodeRows.isEmpty()) {
+            return null;
+        }
         final JsonObject output = new JsonObject();
         final JsonArray chars = new JsonArray();
 
@@ -456,7 +469,7 @@ public class Glyph {
      * Useful to easily get the MiniMessage-tag for a glyph
      */
     public String getGlyphTag() {
-        return '<' + "glyph;" + name + '>';
+        return "<glyph:" + name + '>';
     }
 
     public String getShortGlyphTag() {
@@ -464,8 +477,10 @@ public class Glyph {
     }
 
     public Component getGlyphComponent() {
-        return Component.textOfChildren(
-                Component.text(getCharacter(), NamedTextColor.WHITE).font(getFont()).hoverEvent(getGlyphHoverText()));
+        Component component = Component.text(getFormattedUnicodes(), NamedTextColor.WHITE)
+                .font(getFont())
+                .hoverEvent(getGlyphHoverText());
+        return Component.textOfChildren(GlyphAppearance.applyShadowColor(component, appearance.shadowColor()));
     }
 
     @Nullable

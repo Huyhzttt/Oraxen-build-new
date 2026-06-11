@@ -21,14 +21,20 @@ import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
-import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.jetbrains.annotations.Nullable;
 
 public class ReloadCommand {
 
+    private static final String PACK_RELOAD = "pack";
+    private static final String ITEMS_RELOAD = "items";
+    private static final String RECIPES_RELOAD = "recipes";
+    private static final String CONFIGS_RELOAD = "configs";
+    private static final String MESSAGES_RELOAD = "messages";
+    private static final String HUD_RELOAD = "huds";
+
     public static void reloadItems(@Nullable CommandSender sender) {
-        Message.RELOAD.send(sender, AdventureUtils.tagResolver("reloaded", "items"));
+        sendReloadMessage(sender, ITEMS_RELOAD);
         OraxenItems.loadItems();
         OraxenPlugin.get().getInvManager().regen();
         Bukkit.getPluginManager().callEvent(new OraxenItemsLoadedEvent());
@@ -39,15 +45,12 @@ public class ReloadCommand {
                 // Use runForEntity for Folia compatibility - inventory must be accessed on player's region thread
                 SchedulerUtil.runForEntity(player, () -> {
                     PlayerInventory inventory = player.getInventory();
-                    for (int i = 0; i < inventory.getSize(); i++) {
-                        ItemStack oldItem = inventory.getItem(i);
-                        ItemStack newItem = ItemUpdater.updateItem(oldItem);
-                        if (oldItem == null || oldItem.equals(newItem))
-                            continue;
-                        inventory.setItem(i, newItem);
-                    }
+                    ItemUpdater.updateInventory(inventory);
+                    ItemUpdater.updateInventory(player.getEnderChest());
                 });
             }
+            ItemUpdater.updateLoadedEntityContents();
+            ItemUpdater.updateLoadedTileEntityContents();
         }
 
         if (Settings.UPDATE_FURNITURE.toBool() && Settings.UPDATE_FURNITURE_ON_RELOAD.toBool()) {
@@ -60,12 +63,12 @@ public class ReloadCommand {
     }
 
     public static void reloadPack(@Nullable CommandSender sender) {
-        Message.PACK_REGENERATED.send(sender);
+        sendReloadMessage(sender, PACK_RELOAD);
         OraxenPack.reloadPack();
     }
 
     public static void reloadHud(@Nullable CommandSender sender) {
-        Message.RELOAD.send(sender, AdventureUtils.tagResolver("reloaded", "hud"));
+        sendReloadMessage(sender, HUD_RELOAD);
         OraxenPlugin.get().reloadConfigs();
         HudManager hudManager = new HudManager(OraxenPlugin.get().getConfigsManager());
         OraxenPlugin.get().setHudManager(hudManager);
@@ -76,8 +79,22 @@ public class ReloadCommand {
     }
 
     public static void reloadRecipes(@Nullable CommandSender sender) {
-        Message.RELOAD.send(sender, AdventureUtils.tagResolver("reloaded", "recipes"));
+        sendReloadMessage(sender, RECIPES_RELOAD);
         RecipesManager.reload();
+    }
+
+    public static void reloadConfigs(@Nullable CommandSender sender) {
+        sendReloadMessage(sender, CONFIGS_RELOAD);
+        OraxenPlugin.get().reloadConfigs();
+    }
+
+    public static void reloadMessages(@Nullable CommandSender sender) {
+        sendReloadMessage(sender, MESSAGES_RELOAD);
+        OraxenPlugin.get().reloadConfigs();
+    }
+
+    private static void sendReloadMessage(@Nullable CommandSender sender, String reloaded) {
+        Message.RELOAD.send(sender, AdventureUtils.tagResolver("reloaded", reloaded));
     }
 
     CommandAPICommand getReloadCommand() {
@@ -85,18 +102,19 @@ public class ReloadCommand {
                 .withAliases("rl")
                 .withPermission("oraxen.command.reload")
                 .withArguments(new TextArgument("type").replaceSuggestions(
-                        ArgumentSuggestions.strings("items", "pack", "hud", "recipes", "messages", "all")))
+                        ArgumentSuggestions.strings("items", "pack", "hud", "recipes", "configs", "messages", "all")))
                 .executes((sender, args) -> {
                     switch (((String) args.get("type")).toUpperCase()) {
                         case "HUD" -> reloadHud(sender);
                         case "ITEMS" -> reloadItems(sender);
                         case "PACK" -> reloadPack(sender);
                         case "RECIPES" -> reloadRecipes(sender);
-                        case "CONFIGS" -> OraxenPlugin.get().reloadConfigs();
+                        case "CONFIGS" -> reloadConfigs(sender);
+                        case "MESSAGES" -> reloadMessages(sender);
                         default -> {
                             MechanicsManager.unloadListeners();
                             MechanicsManager.unregisterTasks();
-                            OraxenPlugin.get().reloadConfigs();
+                            reloadMessages(sender);
                             MechanicsManager.registerNativeMechanics();
                             reloadItems(sender);
                             reloadPack(sender);

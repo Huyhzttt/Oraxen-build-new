@@ -54,12 +54,12 @@ public class GlyphCommand {
 
                                 if (!onlyShowPermissable) {
                                     permissionMessage += emoji.hasPermission(player) ?
-                                            ("\n" + ChatColor.GREEN + "Permitted") : ("\n" + ChatColor.RED + "No Permission");
+                                            ("\n" + ChatColor.GREEN + "Permitted.") : ("\n" + ChatColor.RED + "No Permission.");
                                 }
                             }
 
                             pages = pages.append(AdventureUtils.MINI_MESSAGE.deserialize("<glyph:" + emoji.getName() + ">")
-                                    .clickEvent(ClickEvent.clickEvent(ClickEvent.Action.SUGGEST_COMMAND, String.valueOf(emoji.getCharacter())))
+                                    .clickEvent(ClickEvent.clickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, emoji.getCharacters()))
                                     .hoverEvent(HoverEvent.hoverEvent(HoverEvent.Action.SHOW_TEXT, Component.text(finalString + permissionMessage))));
                         }
                     }

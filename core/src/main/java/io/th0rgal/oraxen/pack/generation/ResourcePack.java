@@ -17,6 +17,8 @@ import io.th0rgal.oraxen.font.TextEffect;
 import net.kyori.adventure.key.Key;
 import io.th0rgal.oraxen.items.ItemBuilder;
 import io.th0rgal.oraxen.items.OraxenMeta;
+import io.th0rgal.oraxen.painting.CustomPainting;
+import io.th0rgal.oraxen.painting.PaintingDatapack;
 import io.th0rgal.oraxen.pack.upload.UploadManager;
 import io.th0rgal.oraxen.utils.*;
 import io.th0rgal.oraxen.utils.customarmor.ComponentArmorModels;
@@ -27,6 +29,7 @@ import io.th0rgal.oraxen.utils.logs.Logs;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.bukkit.Material;
+import org.bukkit.configuration.ConfigurationSection;
 
 import javax.imageio.ImageIO;
 import java.awt.AlphaComposite;
@@ -211,10 +214,13 @@ public class ResourcePack {
     private void finishSinglePackOutputOnMain(ExecutorService packWorker, List<VirtualFile> output) {
         try {
             soundGenerator.generateSound(output);
+            generatePaintingDatapack(output);
 
             OraxenPackGeneratedEvent event = new OraxenPackGeneratedEvent(output);
             EventUtils.callEvent(event);
-            writeSinglePackAsync(packWorker, event.getOutput());
+            output = event.getOutput();
+            PackObfuscator.obfuscate(output);
+            writeSinglePackAsync(packWorker, output);
         } catch (Exception exception) {
             handleGenerationFailure(packWorker, "sync pack finalization", exception);
         }
@@ -224,6 +230,7 @@ public class ResourcePack {
         try {
             packWorker.submit(() -> {
                 try {
+                    filterGeneratedCoreShadersBelow1214(output, MinecraftVersion.getCurrentVersion());
                     ZipUtils.writeZipFile(pack, output);
                     SchedulerUtil.runTask(this::uploadGeneratedPackAndFinish);
                 } catch (Exception exception) {
@@ -307,7 +314,9 @@ public class ResourcePack {
             e.printStackTrace();
         }
 
-        extractInPackIfNotExists(new File(packFolder, "pack.mcmeta"));
+        if (!isMcmetaGenerationDisabled()) {
+            extractInPackIfNotExists(new File(packFolder, "pack.mcmeta"));
+        }
         extractInPackIfNotExists(new File(packFolder, "pack.png"));
         updatePackMcmeta();
 
@@ -424,19 +433,37 @@ public class ResourcePack {
     private void generateItemAppearanceAssets(Map<Material, Map<String, ItemBuilder>> texturedItems) {
         final boolean is1_21_4Plus = VersionUtil.atOrAbove("1.21.4");
 
-        if (is1_21_4Plus) {
-            AppearanceMode.validateAndLogWarnings();
+        // Whether 1.21.4+ clients will consume this pack: either we are running on
+        // such a server, or we are emitting a multi-version pack that targets them.
+        final boolean targets1_21_4Plus = is1_21_4Plus || multiVersionResolved;
 
-            if (AppearanceMode.isItemPropertiesEnabled()) {
+        if (targets1_21_4Plus) {
+            // In multi-version mode, model definitions must always be generated regardless
+            // of server version because some target pack versions serve 1.21.4+ clients.
+            if (is1_21_4Plus) {
+                AppearanceMode.validateAndLogWarnings();
+            }
+
+            // Multi-version mode always needs model definitions (some target pack
+            // versions serve 1.21.4+ clients regardless of server version).
+            // For non-multi-version 1.21.4+, honor the user's item_properties toggle
+            // so explicitly disabling that appearance system suppresses the
+            // assets/oraxen/items/*.json output as it did pre-#1812.
+            if (multiVersionResolved || AppearanceMode.isItemPropertiesEnabled()) {
                 generateModelDefinitions(filterForItemModel(texturedItems));
             }
 
-            if (AppearanceMode.shouldGenerateVanillaItemDefinitions()) {
+            // In multi-version mode, 1.21.4+ targets ALWAYS need vanilla item definitions
+            // as a fallback for clients that cannot use legacy CMD predicates. Otherwise,
+            // honor the AppearanceMode toggle.
+            if (multiVersionResolved || AppearanceMode.shouldGenerateVanillaItemDefinitions()) {
                 boolean useSelect = AppearanceMode.shouldUseSelectForVanillaItemDefs();
                 boolean includeBothModes = AppearanceMode.shouldUseBothDispatchModes();
                 generateVanillaItemDefinitions(filterForPredicates(texturedItems), useSelect, includeBothModes);
             }
+        }
 
+        if (is1_21_4Plus) {
             // Multi-version mode ALWAYS needs predicates because older target clients (1.20-1.21.3)
             // cannot use item definitions and rely solely on legacy predicate model overrides.
             // Uses the resolved flag (not the raw setting) to respect single-pack fallback.
@@ -444,6 +471,7 @@ public class ResourcePack {
                 generatePredicates(filterForPredicates(texturedItems));
             }
         } else {
+            // On 1.21.3- servers, predicates are the primary (or only) item appearance system.
             generatePredicates(filterForPredicates(texturedItems));
         }
     }
@@ -508,6 +536,38 @@ public class ResourcePack {
     private void postProcessOutput(List<VirtualFile> output) {
         postProcessOutputAsyncSafe(output);
         soundGenerator.generateSound(output);
+        generatePaintingDatapack(output);
+    }
+
+    private void generatePaintingDatapack(List<VirtualFile> output) {
+        ConfigurationSection paintingsSection = OraxenPlugin.get().getConfigsManager().getPaintings()
+                .getConfigurationSection("paintings");
+        if (paintingsSection == null) return;
+
+        List<CustomPainting> paintings = new ArrayList<>();
+        for (String key : paintingsSection.getKeys(false)) {
+            ConfigurationSection paintingSection = paintingsSection.getConfigurationSection(key);
+            if (paintingSection == null) continue;
+            if (!paintingSection.getBoolean("enabled", true)) continue;
+
+            try {
+                paintings.add(CustomPainting.fromConfig(key, paintingSection));
+            } catch (IllegalArgumentException exception) {
+                Logs.logWarning("Failed to parse custom painting '" + key + "' in paintings.yml");
+                Logs.debug(exception);
+            }
+        }
+
+        if (!VersionUtil.atOrAbove("1.21")) {
+            if (!paintings.isEmpty()) {
+                Logs.logWarning("Custom paintings require Minecraft 1.21 or newer. Skipping paintings datapack.");
+            }
+            return;
+        }
+
+        PaintingDatapack paintingDatapack = new PaintingDatapack(paintings);
+        paintingDatapack.clearOldDataPack();
+        paintingDatapack.generateAssets(output);
     }
 
     private void postProcessOutputAsyncSafe(List<VirtualFile> output) {
@@ -522,7 +582,7 @@ public class ResourcePack {
             DuplicationHandler.mergeFontFiles(output);
         if (Settings.MERGE_ITEM_MODELS.toBool())
             DuplicationHandler.mergeBaseItemFiles(output);
-        DuplicationHandler.mergeVanillaItemDefinitions(output);
+        DuplicationHandler.mergeVanillaItemDefinitions(output, multiVersionResolved);
 
         List<String> excludedExtensions = Settings.EXCLUDED_FILE_EXTENSIONS.toStringList();
         excludedExtensions.removeIf(f -> f.equals("png") || f.equals("json"));
@@ -552,8 +612,34 @@ public class ResourcePack {
         }
 
         // Use MultiVersionPackGenerator for multi-version zip and upload
-        MultiVersionPackGenerator multiVersionGenerator = new MultiVersionPackGenerator(packFolder);
+        MultiVersionPackGenerator multiVersionGenerator = new MultiVersionPackGenerator(packFolder,
+                textShaderGenerator.getGeneratedCoreShaderHashes());
         multiVersionGenerator.generateMultipleVersions(output, switchingFromSinglePack);
+    }
+
+    private void filterGeneratedCoreShadersBelow1214(List<VirtualFile> output, MinecraftVersion targetVersion) {
+        if (targetVersion.isAtLeast(new MinecraftVersion("1.21.4"))) {
+            return;
+        }
+
+        Map<String, String> generatedShaderHashes = textShaderGenerator.getGeneratedCoreShaderHashes();
+        if (generatedShaderHashes.isEmpty()) {
+            return;
+        }
+
+        output.removeIf(file -> generatedShaderHashes.containsKey(file.getPath())
+                && generatedShaderHashes.get(file.getPath()).equals(sha256(file)));
+    }
+
+    private String sha256(VirtualFile file) {
+        try {
+            byte[] content = file.getInputStream().readAllBytes();
+            file.setInputStream(new ByteArrayInputStream(content));
+            return HashUtils.sha256(content);
+        } catch (IOException | IllegalStateException e) {
+            Logs.logWarning("Failed to hash " + file.getPath() + " while filtering generated shaders: " + e.getMessage());
+            return "";
+        }
     }
 
     /**
@@ -573,6 +659,10 @@ public class ResourcePack {
      * </p>
      */
     private void updatePackMcmeta() {
+        if (isMcmetaGenerationDisabled()) {
+            return;
+        }
+
         Path mcmetaPath = packFolder.toPath().resolve("pack.mcmeta");
         if (!mcmetaPath.toFile().exists())
             return;
@@ -585,6 +675,10 @@ public class ResourcePack {
      * This must be called after {@link #generateFont()} to ensure overlay directories exist.
      */
     private void updatePackMcmetaOverlays() {
+        if (isMcmetaGenerationDisabled()) {
+            return;
+        }
+
         Path mcmetaPath = packFolder.toPath().resolve("pack.mcmeta");
         if (!mcmetaPath.toFile().exists()) {
             return;
@@ -748,6 +842,10 @@ public class ResourcePack {
         root.add("pack", pack);
     }
 
+    private boolean isMcmetaGenerationDisabled() {
+        return Boolean.TRUE.equals(Settings.DISABLE_MCMETA_GENERATION.getValue());
+    }
+
 
     private final boolean extractAssets = !new File(packFolder, "assets").exists();
     private final boolean extractModels = !new File(packFolder, "models").exists();
@@ -845,7 +943,12 @@ public class ResourcePack {
 
     @SafeVarargs
     public final void addModifiers(String groupName, final Consumer<File>... modifiers) {
-        packModifiers.put(groupName, Arrays.asList(modifiers));
+        packModifiers.compute(groupName, (key, existing) -> {
+            List<Consumer<File>> merged = new ArrayList<>();
+            if (existing != null) merged.addAll(existing);
+            merged.addAll(Arrays.asList(modifiers));
+            return merged;
+        });
     }
 
     public static void addOutputFiles(final VirtualFile... files) {
@@ -1003,8 +1106,9 @@ public class ResourcePack {
         final JsonObject output = new JsonObject();
         final JsonArray providers = new JsonArray();
         for (final Glyph glyph : fontManager.getGlyphs()) {
-            if (!glyph.hasBitmap())
-                providers.add(glyph.toJson());
+            if (glyph.hasBitmap()) continue;
+            JsonObject glyphJson = glyph.toJson();
+            if (glyphJson != null) providers.add(glyphJson);
         }
         for (FontManager.GlyphBitMap glyphBitMap : FontManager.glyphBitMaps.values()) {
             providers.add(glyphBitMap.toJson(fontManager));
@@ -1027,14 +1131,35 @@ public class ResourcePack {
         // Generate the dedicated shift font (still useful for explicit font references)
         generateShiftFont(fontManager);
 
-        // Generate effect fonts for text effects
+        // Always generate effect fonts and animated glyphs. The earlier "skip on
+        // legacy single-pack servers" guard was a workaround for the pre-#1812
+        // shader generator emitting wrong GLSL versions; now that the generator
+        // emits per-target shaders correctly, BASE_ONLY mode produces valid
+        // 1.20-1.21.3 shaders for legacy single-pack servers, so the skip would
+        // silently disable text effects/animated glyphs there (regression vs master).
         generateEffectFonts();
 
         // Process animated glyph fonts
         boolean hasAnimatedGlyphs = processAnimatedGlyphs(fontManager);
 
         // Generate text shaders when needed (animated glyphs and/or text effects).
-        textShaderGenerator.maybeGenerateTextShaders(hasAnimatedGlyphs);
+        // In multi-version mode the choice depends on the *server* version:
+        //   - 1.21.4+ server: skip base shaders and only emit 1.21.4+ overlays so
+        //     1.21.3- clients never receive #version 330+ GLSL.
+        //   - 1.20-1.21.3 server: emit base shaders for the server's legacy format
+        //     AND 1.21.4+ overlays. Without the base emission, legacy clients on a
+        //     multi-version pack would silently lose animated glyph / text effect
+        //     rendering (the base format is the legacy one in that case).
+        boolean serverIs1214Plus = VersionUtil.atOrAbove("1.21.4");
+        TextShaderGenerator.ShaderEmissionMode emissionMode;
+        if (multiVersionResolved) {
+            emissionMode = serverIs1214Plus
+                    ? TextShaderGenerator.ShaderEmissionMode.OVERLAY_ONLY_1214_PLUS
+                    : TextShaderGenerator.ShaderEmissionMode.BASE_PLUS_1214_OVERLAYS;
+        } else {
+            emissionMode = TextShaderGenerator.ShaderEmissionMode.BASE_ONLY;
+        }
+        textShaderGenerator.maybeGenerateTextShaders(hasAnimatedGlyphs, emissionMode);
     }
 
     /**
@@ -1086,7 +1211,9 @@ public class ResourcePack {
         // BEFORE animated glyphs are created, ensuring clean codepoint allocation on
         // reload.
 
-        Logs.logInfo("Processing " + animatedGlyphs.size() + " animated glyphs...");
+        if (Settings.DEBUG.toBool()) {
+            Logs.logInfo("Processing " + animatedGlyphs.size() + " animated glyphs...");
+        }
 
         for (AnimatedGlyph animGlyph : animatedGlyphs) {
             processAnimatedGlyph(animGlyph);
@@ -1237,16 +1364,31 @@ public class ResourcePack {
         if (fontJson != null) {
             writeStringToVirtual("assets/oraxen/font/animations", animGlyph.getName() + ".json",
                     fontJson.toString());
-            Logs.logSuccess("Generated animation font for: " + animGlyph.getName() +
-                    " (" + animGlyph.getFrameCount() + " frames @ " + animGlyph.getFps() + " fps)");
+            if (Settings.DEBUG.toBool()) {
+                Logs.logSuccess("Generated animation font for: " + animGlyph.getName() +
+                        " (" + animGlyph.getFrameCount() + " frames @ " + animGlyph.getFps() + " fps)");
+            }
         }
     }
 
 
     public static void writeStringToVirtual(String folder, String name, String content) {
-        folder = !folder.endsWith("/") ? folder : folder.substring(0, folder.length() - 1);
         addOutputFiles(
-                new VirtualFile(folder, name, new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8))));
+                new VirtualFile(normalizeVirtualFolder(folder), name, new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    public static String normalizeVirtualPath(String folder, String name) {
+        String normalizedFolder = normalizeVirtualFolder(folder);
+        String normalizedName = name == null ? "" : name.trim();
+        while (normalizedName.startsWith("/")) normalizedName = normalizedName.substring(1);
+        return normalizedFolder.isEmpty() ? normalizedName : normalizedFolder + "/" + normalizedName;
+    }
+
+    private static String normalizeVirtualFolder(String folder) {
+        String normalizedFolder = folder == null ? "" : folder.trim();
+        while (normalizedFolder.endsWith("/")) normalizedFolder = normalizedFolder.substring(0, normalizedFolder.length() - 1);
+        while (normalizedFolder.startsWith("/")) normalizedFolder = normalizedFolder.substring(1);
+        return normalizedFolder;
     }
 
     public static void deleteFileFromVirtualAndDisk(String folder, String name) {
@@ -1312,6 +1454,7 @@ public class ResourcePack {
     private void mergeUploadedPacks(List<VirtualFile> output) {
         PackMerger packMerger = new PackMerger(packFolder);
         List<VirtualFile> mergedFiles = packMerger.mergeUploadedPacks();
+        PackMcmetaUtils.mergeOverlayEntriesIntoOutput(output, packMerger.getMergedOverlayEntries());
 
         if (!mergedFiles.isEmpty()) {
             output.addAll(mergedFiles);
